@@ -1,0 +1,41 @@
+{
+    "cuda": true,
+    "database": {
+        "name": "CAVE",
+        "base_path": "Data",
+        "image_bands": 31
+    },
+    "output": {
+        "results_path": "output/resultados_x4"
+    },
+    "training": {
+        "batch_size": 16,
+        "epochs": 100,
+        "learning_rate": 1e-4,
+        "seed": 1
+    },
+    "gpu": {
+        "use_multi_gpu": true,
+        "gpu_ids": [0, 1, 2, 3],
+        "num_threads": 12
+    },
+    "models": {
+        "SFCSR": {
+            "upscale_factor": 4,
+            "n_feats": 32,
+            "n_module": 3
+        },
+        "MCNet": {
+            "upscale_factor": 4,
+            "n_feats": 32,
+            "n_conv": 1,
+            "n_colors": 31
+        },
+        "SFCCBAM": {
+            "upscale_factor": 4,
+            "n_feats": 32,
+            "n_module": 5
+        }
+    },
+    "model_name": "SFCSR"
+}
