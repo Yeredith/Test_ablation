@@ -19,7 +19,38 @@ def SSIM(pred, gt):
     ssim = compute_ssim(pred, gt)  # Aquí pred y gt ya son imágenes 2D
     return ssim
 
-    	
+def EPI(restored,original):
+    # Verifica que las imágenes tengan el mismo número de canales
+    if original.shape != restored.shape:
+        raise ValueError("Las imágenes original y restaurada deben tener la misma forma")
+
+    # Filtro Laplaciano
+    H = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]])
+    epi_values = []
+
+    # Calcula el EPI para cada canal o banda
+    for channel in range(original.shape[0]):  # Itera sobre cada banda o canal
+        # Aplica el filtro Laplaciano
+        delta_original = convolve2d(original[channel], H, mode='same', boundary='symm')
+        delta_restored = convolve2d(restored[channel], H, mode='same', boundary='symm')
+
+        # Promedios de los resultados filtrados
+        mean_delta_original = np.mean(delta_original)
+        mean_delta_restored = np.mean(delta_restored)
+
+        # Componentes de preservación de bordes
+        p1 = delta_original - mean_delta_original
+        p2 = delta_restored - mean_delta_restored
+
+        # Cálculo del índice EPI para el canal actual
+        num = np.sum(p1 * p2)
+        den = np.sqrt(np.sum(p1**2) * np.sum(p2**2))
+        epi_channel = num / den if den != 0 else 0
+        epi_values.append(epi_channel)
+
+    # Promedio del EPI sobre todos los canales
+    return np.mean(epi_values)
+  	
     
 import numpy as np
 

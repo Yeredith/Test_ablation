@@ -145,6 +145,27 @@ def save_checkpoint(model, optimizer, checkpoints_path, epoch):
 
 import matplotlib.pyplot as plt
 
+def load_last_checkpoint(model, optimizer, checkpoints_path):
+    """Carga el último checkpoint disponible, si existe."""
+    if not os.path.exists(checkpoints_path):
+        return model, optimizer, 0  # No hay checkpoints, empezar desde el principio
+
+    checkpoint_files = sorted(
+        [f for f in os.listdir(checkpoints_path) if f.startswith("model_epoch_")],
+        key=lambda x: int(x.split("_")[-1].split(".")[0]),
+    )
+    if not checkpoint_files:
+        return model, optimizer, 0  # No hay checkpoints válidos
+
+    last_checkpoint_path = os.path.join(checkpoints_path, checkpoint_files[-1])
+    print(f"Cargando el último checkpoint: {last_checkpoint_path}")
+    checkpoint = torch.load(last_checkpoint_path)
+
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    start_epoch = checkpoint["epoch"]
+    return model, optimizer, start_epoch
+
 def save_plots(loss_values, psnr_values, graphs_path, epoch):
     """Genera y guarda gráficos de pérdida y PSNR."""
     os.makedirs(graphs_path, exist_ok=True)  # Asegura que la carpeta existe
@@ -172,50 +193,75 @@ def save_plots(loss_values, psnr_values, graphs_path, epoch):
     plt.savefig(psnr_plot_path)
     plt.close()
     print(f"Gráfico de PSNR guardado: {psnr_plot_path}")
+    
+from eval import SAM, EPI
 
-# Prueba
-def test_model(test_loader, model, device, test_path):
+def test_model(test_loader, model, model_name, device, test_path):
     model.eval()
-    test_results = {"PSNR": [], "Time": []}
+    test_results = {"PSNR": [], "SAM": [], "EPI": [], "Time": []}
 
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Testeando"):
+        for batch in tqdm(test_loader, desc=f"Testeando {model_name}"):
             inputs, labels = batch[0].to(device), batch[1].to(device)
+
+            # Ajustar dinámicamente band_mean solo para MCNet
+            if model_name == "MCNet" and hasattr(model, 'band_mean'):
+                if model.band_mean.size(1) != inputs.size(1):
+                    print(f"[MCNet] Ajustando band_mean de {model.band_mean.size(1)} a {inputs.size(1)} bandas.")
+                    model.band_mean = nn.Parameter(torch.zeros(1, inputs.size(1), 1, 1), requires_grad=False).to(device)
+
+            # Realizar predicción
             start_time = torch.cuda.Event(enable_timing=True)
             end_time = torch.cuda.Event(enable_timing=True)
 
             start_time.record()
-            # Realizar predicciones
-            localFeats = None
-            outputs = torch.zeros_like(labels)
-            for i in range(inputs.shape[1]):
-                if i == 0:
-                    x = inputs[:, 0:3, :, :]
-                    y = inputs[:, 0, :, :]
-                elif i == inputs.shape[1] - 1:
-                    x = inputs[:, i-2:i+1, :, :]
-                    y = inputs[:, i, :, :]
-                else:
-                    x = inputs[:, i-1:i+2, :, :]
-                    y = inputs[:, i, :, :]
-                output, localFeats = model(x, y, localFeats, i)
-                outputs[:, i, :, :] = output
+            if model_name == "MCNet":
+                outputs = model(inputs)
+            else:  # Para SFCSR y SFCCBAM
+                localFeats = None
+                outputs = torch.zeros_like(labels)
+                for i in range(inputs.shape[1]):
+                    if i == 0:
+                        x = inputs[:, 0:3, :, :]
+                        y = inputs[:, 0, :, :]
+                    elif i == inputs.shape[1] - 1:
+                        x = inputs[:, i-2:i+1, :, :]
+                        y = inputs[:, i, :, :]
+                    else:
+                        x = inputs[:, i-1:i+2, :, :]
+                        y = inputs[:, i, :, :]
+                    output, localFeats = model(x, y, localFeats, i)
+                    outputs[:, i, :, :] = output
 
             end_time.record()
             torch.cuda.synchronize()
             elapsed_time = start_time.elapsed_time(end_time)
 
-            # Guardar resultados
-            test_results["PSNR"].append(10 * torch.log10(1 / ((outputs - labels) ** 2).mean()).item())
+            # Convertir a formato numpy para las métricas SAM y EPI
+            outputs_np = outputs.cpu().numpy().squeeze()
+            labels_np = labels.cpu().numpy().squeeze()
+
+            # Calcular métricas
+            psnr = 10 * torch.log10(1 / ((outputs - labels) ** 2).mean())
+            sam = SAM(outputs_np, labels_np)
+            epi = EPI(outputs_np, labels_np)
+
+            test_results["PSNR"].append(psnr.item())
+            test_results["SAM"].append(sam)
+            test_results["EPI"].append(epi)
             test_results["Time"].append(elapsed_time)
+
+            print(f"Imagen procesada con {model_name}: PSNR: {psnr:.4f}, SAM: {sam:.4f}, EPI: {epi:.4f}, Tiempo: {elapsed_time:.2f}ms")
 
     # Guardar métricas
     metrics_path = os.path.join(test_path, "metrics.json")
     with open(metrics_path, "w") as metrics_file:
         json.dump(test_results, metrics_file)
 
-# Main
-# Main
+    print(f"Pruebas completadas para {model_name}. Resultados guardados en {metrics_path}.")
+
+
+
 def main():
     config = load_config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -223,8 +269,11 @@ def main():
 
     train_dataset = TrainsetFromFolder(os.path.join(config["database"]["base_path"], "Train", config["database"]["name"], "4"))
     val_dataset = ValsetFromFolder(os.path.join(config["database"]["base_path"], "Validation", config["database"]["name"], "4"))
+    test_dataset = TestsetFromFolder(os.path.join(config["database"]["base_path"], "Test", config["database"]["name"], "4"))
+
     train_loader = DataLoader(train_dataset, batch_size=config["training"]["batch_size"], shuffle=True, num_workers=config["gpu"]["num_threads"])
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=config["gpu"]["num_threads"])
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=config["gpu"]["num_threads"])
 
     model_name = config["model_name"]
     model = select_model(config).to(device)
@@ -236,14 +285,23 @@ def main():
     criterion = nn.L1Loss()
 
     checkpoints_path, graphs_path = setup_output_paths(config, model_name)
+    test_path = os.path.join(config["output"]["results_path"], model_name, "test_results")
+    os.makedirs(test_path, exist_ok=True)
+
+    model, optimizer, start_epoch = load_last_checkpoint(model, optimizer, checkpoints_path)
+
+    if start_epoch >= config["training"]["epochs"]:
+        print(f"El entrenamiento para {model_name} ya está completo. Pasando directamente a las pruebas.")
+        test_model(test_loader, model, model_name, device, test_path)
+        return
 
     loss_values = []
     psnr_values = []
 
-    for epoch in range(1, config["training"]["epochs"] + 1):
+    for epoch in range(start_epoch + 1, config["training"]["epochs"] + 1):
         print(f"Epoch {epoch}/{config['training']['epochs']}")
-        train_loss = train(train_loader, model, optimizer, criterion, device, model_name)  # Se pasa model_name
-        val_psnr = val(val_loader, model, device, model_name)  # Se pasa model_name
+        train_loss = train(train_loader, model, optimizer, criterion, device, model_name)
+        val_psnr = val(val_loader, model, device, model_name)
 
         loss_values.append(train_loss)
         psnr_values.append(val_psnr)
@@ -253,8 +311,7 @@ def main():
 
         print(f"Epoch {epoch}, Loss: {train_loss:.4f}, PSNR: {val_psnr:.4f}")
 
-    # Llamar a test_model tras finalizar el entrenamiento
-    test_model(model, device, config)
+    test_model(test_loader, model, model_name, device, test_path)
 
 
 
