@@ -71,9 +71,9 @@ def SAM(pred, gt):
         sam = 0.0
 
     # Convertir el SAM de radianes a grados
-    sam_deg = sam * 180 / np.pi
+    #sam_deg = sam * 180 / np.pi
     
-    return sam_deg
+    return sam
 
 
 def SAM_pixeles(pred, gt):
@@ -103,9 +103,9 @@ def SAM_pixeles(pred, gt):
         sam = 0
     
     # Convertir el SAM de radianes a grados
-    sam_deg = sam * 180 / np.pi
+    #sam_deg = sam * 180 / np.pi
     
-    return sam_deg
+    return sam
 
 
 

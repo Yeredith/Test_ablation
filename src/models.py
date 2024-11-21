@@ -346,7 +346,6 @@ class MCNet(nn.Module):
         
         return x
 
-
 #################################
            #SFCCBAM
 #################################
@@ -482,3 +481,185 @@ class SFCCBAM(nn.Module):
         y = y.squeeze(1)   
                 
         return y, localFeats  
+    
+#################################
+#######Hybrid-SFCSR##############
+#################################
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation (SE) Block"""
+    def __init__(self, channels, reduction=8):
+        super(SEBlock, self).__init__()
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(channels // reduction, channels, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        se_weight = self.global_avg_pool(x)
+        se_weight = self.fc1(se_weight)
+        se_weight = self.relu(se_weight)
+        se_weight = self.fc2(se_weight)
+        se_weight = self.sigmoid(se_weight)
+        return x * se_weight
+
+
+class CBAMBlock(nn.Module):
+    """Convolutional Block Attention Module (CBAM)"""
+    def __init__(self, channels, reduction=8, kernel_size=7):
+        super(CBAMBlock, self).__init__()
+        # Channel Attention
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False)
+        self.sigmoid_channel = nn.Sigmoid()
+
+        # Spatial Attention
+        self.conv_spatial = nn.Conv2d(2, 1, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, bias=False)
+        self.sigmoid_spatial = nn.Sigmoid()
+
+    def forward(self, x):
+        # Channel Attention
+        avg_pool = self.global_avg_pool(x)
+        max_pool = self.global_max_pool(x)
+        channel_attention = self.fc1(avg_pool) + self.fc1(max_pool)
+        channel_attention = self.relu(channel_attention)
+        channel_attention = self.fc2(channel_attention)
+        channel_attention = self.sigmoid_channel(channel_attention)
+        x = x * channel_attention
+
+        # Spatial Attention
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_attention = self.conv_spatial(torch.cat([avg_out, max_out], dim=1))
+        spatial_attention = self.sigmoid_spatial(spatial_attention)
+        x = x * spatial_attention
+
+        return x
+
+
+class CombinedAttention(nn.Module):
+    """Combining SE Block and CBAM Block"""
+    def __init__(self, channels, reduction=8, kernel_size=7):
+        super(CombinedAttention, self).__init__()
+        self.se_block = SEBlock(channels, reduction)
+        self.cbam_block = CBAMBlock(channels, reduction, kernel_size)
+
+    def forward(self, x):
+        x = self.se_block(x)
+        x = self.cbam_block(x)
+        return x
+
+class HYBRID_SE_CBAM(nn.Module):
+    def __init__(self, args):
+        super(HYBRID_SE_CBAM, self).__init__()
+        
+        scale = args.upscale_factor
+        n_feats = args.n_feats
+        self.n_module = args.n_module        
+                 
+        wn = lambda x: torch.nn.utils.weight_norm(x)
+    
+        self.gamma_X = nn.Parameter(torch.ones(self.n_module)) 
+        self.gamma_Y = nn.Parameter(torch.ones(self.n_module)) 
+        self.gamma_DFF = nn.Parameter(torch.ones(4))
+        self.gamma_FCF = nn.Parameter(torch.ones(2))
+        
+        # Head 
+        ThreeHead = [wn(nn.Conv3d(1, n_feats, kernel_size=(1,3,3), stride=1, padding=(0,1,1), bias=False)),
+                     wn(nn.Conv3d(n_feats, n_feats, kernel_size=(3,1,1), stride=1, padding=(1,0,0), bias=False))]
+        self.ThreeHead = nn.Sequential(*ThreeHead)
+
+        TwoHead = [wn(nn.Conv2d(1, n_feats, kernel_size=(3,3),  stride=1, padding=(1,1), bias=False))]
+        self.TwoHead = nn.Sequential(*TwoHead)
+
+        # Tail 
+        TwoTail = []
+        if (scale & (scale - 1)) == 0: 
+            for _ in range(int(math.log(scale, 2))):
+                TwoTail.append(wn(nn.Conv2d(n_feats, n_feats*4, kernel_size=(3,3), stride=1, padding=(1,1), bias=False)))
+                TwoTail.append(nn.PixelShuffle(2))           
+        else:
+            TwoTail.append(wn(nn.Conv2d(n_feats, n_feats*9, kernel_size=(3,3), stride=1, padding=(1,1), bias=False)))
+            TwoTail.append(nn.PixelShuffle(3))  
+        TwoTail.append(wn(nn.Conv2d(n_feats, 1, kernel_size=(3,3),  stride=1, padding=(1,1), bias=False)))                                 	    	
+        self.TwoTail = nn.Sequential(*TwoTail)
+
+        # Convoluciones y atenciones
+        self.twoCNN = nn.Sequential(*[TwoCNN(wn, n_feats) for _ in range(self.n_module)])
+        self.reduceD_Y = wn(nn.Conv2d(n_feats*self.n_module, n_feats, kernel_size=(1,1), stride=1, bias=False))                          
+        self.twofusion = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(3,3),  stride=1, padding=(1,1), bias=False))
+
+        self.threeCNN = nn.Sequential(*[ThreeCNN(wn, n_feats) for _ in range(self.n_module)])
+        self.reduceD = nn.Sequential(*[wn(nn.Conv2d(n_feats*4, n_feats, kernel_size=(1,1), stride=1, bias=False)) for _ in range(self.n_module)])                              
+        self.reduceD_X = wn(nn.Conv3d(n_feats*self.n_module, n_feats, kernel_size=(1,1,1), stride=1, bias=False))
+        
+        threefusion = [wn(nn.Conv3d(n_feats, n_feats, kernel_size=(1,3,3), stride=1, padding=(0,1,1), bias=False)),
+                       wn(nn.Conv3d(n_feats, n_feats, kernel_size=(3,1,1), stride=1, padding=(1,0,0), bias=False))]
+        self.threefusion = nn.Sequential(*threefusion)
+
+        self.reduceD_DFF = wn(nn.Conv2d(n_feats*4, n_feats, kernel_size=(1,1), stride=1, bias=False))  
+        self.conv_DFF = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(1,1), stride=1, bias=False)) 
+        self.reduceD_FCF = wn(nn.Conv2d(n_feats*2, n_feats, kernel_size=(1,1), stride=1, bias=False))  
+        self.conv_FCF = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(1,1), stride=1, bias=False))    
+
+        # SE Block and CBAM Block Integration
+        self.se_block = SEBlock(n_feats)
+        self.cbam_block = CBAMBlock(n_feats)
+
+    def forward(self, x, y, localFeats, i):
+        x = x.unsqueeze(1)     
+        x = self.ThreeHead(x)    
+        skip_x = x         
+
+        y = y.unsqueeze(1)
+        y = self.TwoHead(y)
+        skip_y = y
+
+        channelX = []
+        channelY = []        
+
+        for j in range(self.n_module):        
+            x = self.threeCNN[j](x)    
+            x = torch.add(skip_x, x)          
+            channelX.append(self.gamma_X[j]*x)
+
+            y = self.twoCNN[j](y)           
+            y = torch.cat([y, x[:,:,0,:,:], x[:,:,1,:,:], x[:,:,2,:,:]],1)
+            y = self.reduceD[j](y)      
+            y = torch.add(skip_y, y)         
+            channelY.append(self.gamma_Y[j]*y) 
+                              
+        x = torch.cat(channelX, 1)
+        x = self.reduceD_X(x)
+        x = self.threefusion(x)
+      	                
+        y = torch.cat(channelY, 1)        
+        y = self.reduceD_Y(y) 
+        y = self.twofusion(y)        
+
+        # Apply SE Block
+        y = self.se_block(y)
+        # Apply CBAM Block
+        y = self.cbam_block(y)
+     
+        y = torch.cat([self.gamma_DFF[0]*x[:,:,0,:,:], self.gamma_DFF[1]*x[:,:,1,:,:], self.gamma_DFF[2]*x[:,:,2,:,:], self.gamma_DFF[3]*y], 1)
+       
+        y = self.reduceD_DFF(y)  
+        y = self.conv_DFF(y)
+                       
+        if i == 0:
+            localFeats = y
+        else:
+            y = torch.cat([self.gamma_FCF[0]*y, self.gamma_FCF[1]*localFeats], 1) 
+            y = self.reduceD_FCF(y)                    
+            y = self.conv_FCF(y) 
+            localFeats = y  
+        y = torch.add(y, skip_y)
+        y = self.TwoTail(y) 
+        y = y.squeeze(1)   
+                
+        return y, localFeats

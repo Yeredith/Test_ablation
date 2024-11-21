@@ -6,8 +6,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import json
+import numpy as np
 from data_utils import TrainsetFromFolder, ValsetFromFolder, TestsetFromFolder
-from models import SFCSR, MCNet, SFCCBAM
+from models import SFCSR, MCNet, SFCCBAM, HYBRID_SE_CBAM
 
 # Clase para convertir diccionarios en objetos con atributos
 class ConfigNamespace:
@@ -32,6 +33,8 @@ def select_model(config):
         return MCNet(model_config)
     elif model_name == "SFCCBAM":
         return SFCCBAM(model_config)
+    elif model_name == "HYBRID_SE_CBAM":
+        return HYBRID_SE_CBAM(model_config)
     else:
         raise ValueError(f"Modelo no reconocido: {model_name}")
 
@@ -194,14 +197,15 @@ def save_plots(loss_values, psnr_values, graphs_path, epoch):
     plt.close()
     print(f"Gráfico de PSNR guardado: {psnr_plot_path}")
     
-from eval import SAM, EPI
+from scipy.io import savemat  # Importar savemat para guardar imágenes en formato .mat
+from eval import SAM, EPI, SSIM  # Asegúrate de importar las funciones correctamente
 
 def test_model(test_loader, model, model_name, device, test_path):
     model.eval()
-    test_results = {"PSNR": [], "SAM": [], "EPI": [], "Time": []}
+    test_results = {"PSNR": [], "SSIM": [], "SAM": [], "EPI": [], "Time": []}
 
     with torch.no_grad():
-        for batch in tqdm(test_loader, desc=f"Testeando {model_name}"):
+        for batch_idx, batch in enumerate(tqdm(test_loader, desc=f"Testeando {model_name}")):
             inputs, labels = batch[0].to(device), batch[1].to(device)
 
             # Ajustar dinámicamente band_mean solo para MCNet
@@ -237,7 +241,7 @@ def test_model(test_loader, model, model_name, device, test_path):
             torch.cuda.synchronize()
             elapsed_time = start_time.elapsed_time(end_time)
 
-            # Convertir a formato numpy para las métricas SAM y EPI
+            # Convertir a formato numpy para las métricas SAM, EPI y SSIM
             outputs_np = outputs.cpu().numpy().squeeze()
             labels_np = labels.cpu().numpy().squeeze()
 
@@ -246,12 +250,23 @@ def test_model(test_loader, model, model_name, device, test_path):
             sam = SAM(outputs_np, labels_np)
             epi = EPI(outputs_np, labels_np)
 
-            test_results["PSNR"].append(psnr.item())
-            test_results["SAM"].append(sam)
-            test_results["EPI"].append(epi)
-            test_results["Time"].append(elapsed_time)
+            # Calcular SSIM por banda y promediar
+            ssim_per_band = [SSIM(outputs_np[i], labels_np[i]) for i in range(outputs_np.shape[0])]
+            ssim = np.mean(ssim_per_band)
 
-            print(f"Imagen procesada con {model_name}: PSNR: {psnr:.4f}, SAM: {sam:.4f}, EPI: {epi:.4f}, Tiempo: {elapsed_time:.2f}ms")
+            # Convertir métricas a tipo float estándar
+            test_results["PSNR"].append(float(psnr.item()))
+            test_results["SSIM"].append(float(ssim))
+            test_results["SAM"].append(float(sam))
+            test_results["EPI"].append(float(epi))
+            test_results["Time"].append(float(elapsed_time))
+
+            # Guardar imagen generada como archivo .mat
+            output_file = os.path.join(test_path, f"output_image_{batch_idx + 1}.mat")
+            savemat(output_file, {'generated': outputs_np, 'ground_truth': labels_np})
+            print(f"Imagen guardada en {output_file}")
+
+            print(f"Imagen procesada con {model_name}: PSNR: {psnr:.4f}, SSIM: {ssim:.4f}, SAM: {sam:.4f}, EPI: {epi:.4f}, Tiempo: {elapsed_time:.2f}ms")
 
     # Guardar métricas
     metrics_path = os.path.join(test_path, "metrics.json")
@@ -259,7 +274,6 @@ def test_model(test_loader, model, model_name, device, test_path):
         json.dump(test_results, metrics_file)
 
     print(f"Pruebas completadas para {model_name}. Resultados guardados en {metrics_path}.")
-
 
 
 def main():
