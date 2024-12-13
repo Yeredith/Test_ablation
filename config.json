@@ -10,7 +10,7 @@
     },
     "training": {
         "batch_size": 16,
-        "epochs": 100,
+        "epochs": 15,
         "learning_rate": 1e-4,
         "seed": 1
     },
@@ -35,7 +35,17 @@
             "upscale_factor": 4,
             "n_feats": 32,
             "n_module": 5
+        },
+        "HYBRID_SE_CBAM": {
+            "upscale_factor": 4,
+            "n_feats": 32,
+            "n_module": 5,
+            "attention_blocks": {
+                "se_reduction": 8,
+                "cbam_reduction": 8,
+                "cbam_kernel_size": 7
+            }
         }
     },
-    "model_name": "SFCSR"
+    "model_list": ["SFCSR", "MCNet", "SFCCBAM", "HYBRID_SE_CBAM"]
 }
