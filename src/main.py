@@ -1,3 +1,4 @@
+#Bien
 import os
 import torch
 import torch.nn as nn
@@ -6,9 +7,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import json
+import csv
 import numpy as np
 from data_utils import TrainsetFromFolder, ValsetFromFolder, TestsetFromFolder
 from models import SFCSR, MCNet, SFCCBAM, HYBRID_SE_CBAM
+from scipy.io import savemat
+from eval import SAM, EPI, SSIM
 
 # Clase para convertir diccionarios en objetos con atributos
 class ConfigNamespace:
@@ -22,8 +26,7 @@ def load_config():
         return json.load(file)
 
 # Selección de modelo
-def select_model(config):
-    model_name = config["model_name"]
+def select_model(config, model_name):
     model_config = ConfigNamespace(config["models"][model_name])
     model_config.cuda = config.get("cuda", False)  # Asegurar atributo cuda
 
@@ -40,17 +43,15 @@ def select_model(config):
 
 # Configurar rutas de salida
 def setup_output_paths(config, model_name):
-    """Configura las rutas de salida para checkpoints y gráficos."""
     base_path = config["output"]["results_path"]
     model_path = os.path.join(base_path, model_name)
     checkpoints_path = os.path.join(model_path, "checkpoints")
-    graphs_path = os.path.join(model_path, "graphs")
+    csv_path = os.path.join(model_path, "metrics.csv")
+    params_csv_path = os.path.join(model_path, "params.csv")
 
-    # Crear las carpetas necesarias si no existen
     os.makedirs(checkpoints_path, exist_ok=True)
-    os.makedirs(graphs_path, exist_ok=True)
 
-    return checkpoints_path, graphs_path  # Solo devuelve estos dos valores
+    return checkpoints_path, csv_path, params_csv_path
 
 
 def train(train_loader, model, optimizer, criterion, device, model_name):
@@ -135,16 +136,23 @@ def val(val_loader, model, device, model_name):
 
 
 def save_checkpoint(model, optimizer, checkpoints_path, epoch):
-    """Guarda el estado del modelo y el optimizador en un checkpoint."""
     model_out_path = os.path.join(checkpoints_path, f"model_epoch_{epoch}.pth")
     state = {
         "epoch": epoch,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict()
     }
-    os.makedirs(checkpoints_path, exist_ok=True)  # Asegura que la carpeta existe
+    os.makedirs(checkpoints_path, exist_ok=True)
     torch.save(state, model_out_path)
     print(f"Checkpoint guardado: {model_out_path}")
+
+def save_metrics_to_csv(csv_path, loss_values, psnr_values):
+    with open(csv_path, mode='w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Epoch", "Loss", "PSNR"])
+        for epoch, (loss, psnr) in enumerate(zip(loss_values, psnr_values), start=1):
+            writer.writerow([epoch, loss, psnr])
+    print(f"Métricas guardadas en: {csv_path}")
 
 import matplotlib.pyplot as plt
 
@@ -169,33 +177,7 @@ def load_last_checkpoint(model, optimizer, checkpoints_path):
     start_epoch = checkpoint["epoch"]
     return model, optimizer, start_epoch
 
-def save_plots(loss_values, psnr_values, graphs_path, epoch):
-    """Genera y guarda gráficos de pérdida y PSNR."""
-    os.makedirs(graphs_path, exist_ok=True)  # Asegura que la carpeta existe
 
-    # Gráfico de pérdida
-    plt.figure()
-    plt.plot(range(1, len(loss_values) + 1), loss_values, label="Pérdida (Loss)")
-    plt.xlabel("Épocas")
-    plt.ylabel("Pérdida")
-    plt.title("Pérdida por Época")
-    plt.legend()
-    loss_plot_path = os.path.join(graphs_path, f"loss_plot_epoch_{epoch}.png")
-    plt.savefig(loss_plot_path)
-    plt.close()
-    print(f"Gráfico de pérdida guardado: {loss_plot_path}")
-
-    # Gráfico de PSNR
-    plt.figure()
-    plt.plot(range(1, len(psnr_values) + 1), psnr_values, label="PSNR")
-    plt.xlabel("Épocas")
-    plt.ylabel("PSNR")
-    plt.title("PSNR por Época")
-    plt.legend()
-    psnr_plot_path = os.path.join(graphs_path, f"psnr_plot_epoch_{epoch}.png")
-    plt.savefig(psnr_plot_path)
-    plt.close()
-    print(f"Gráfico de PSNR guardado: {psnr_plot_path}")
     
 from scipy.io import savemat  # Importar savemat para guardar imágenes en formato .mat
 from eval import SAM, EPI, SSIM  # Asegúrate de importar las funciones correctamente
@@ -275,11 +257,17 @@ def test_model(test_loader, model, model_name, device, test_path):
 
     print(f"Pruebas completadas para {model_name}. Resultados guardados en {metrics_path}.")
 
-
+def save_model_params_to_csv(params_csv_path, model_name, model):
+    with open(params_csv_path, mode='w', newline='') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["Model Name", "Total Parameters"])
+        total_params = sum(p.numel() for p in model.parameters())
+        writer.writerow([model_name, total_params])
+    print(f"Parámetros del modelo guardados en: {params_csv_path}")
+    
 def main():
     config = load_config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(config["training"]["seed"])
 
     train_dataset = TrainsetFromFolder(os.path.join(config["database"]["base_path"], "Train", config["database"]["name"], "4"))
     val_dataset = ValsetFromFolder(os.path.join(config["database"]["base_path"], "Validation", config["database"]["name"], "4"))
@@ -289,45 +277,44 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=config["gpu"]["num_threads"])
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=config["gpu"]["num_threads"])
 
-    model_name = config["model_name"]
-    model = select_model(config).to(device)
+    for model_name in config["model_list"]:
+        print(f"Procesando modelo: {model_name}")
+        model = select_model(config, model_name).to(device)
 
-    if config["gpu"]["use_multi_gpu"] and torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model, device_ids=config["gpu"]["gpu_ids"])
+        if config["gpu"]["use_multi_gpu"] and torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model, device_ids=config["gpu"]["gpu_ids"])
 
-    optimizer = optim.Adam(model.parameters(), lr=config["training"]["learning_rate"])
-    criterion = nn.L1Loss()
+        optimizer = optim.Adam(model.parameters(), lr=config["training"]["learning_rate"])
+        criterion = nn.L1Loss()
 
-    checkpoints_path, graphs_path = setup_output_paths(config, model_name)
-    test_path = os.path.join(config["output"]["results_path"], model_name, "test_results")
-    os.makedirs(test_path, exist_ok=True)
+        checkpoints_path, csv_path, params_csv_path = setup_output_paths(config, model_name)
+        test_path = os.path.join(config["output"]["results_path"], model_name, "test_results")
+        os.makedirs(test_path, exist_ok=True)
 
-    model, optimizer, start_epoch = load_last_checkpoint(model, optimizer, checkpoints_path)
+        save_model_params_to_csv(params_csv_path, model_name, model)
 
-    if start_epoch >= config["training"]["epochs"]:
-        print(f"El entrenamiento para {model_name} ya está completo. Pasando directamente a las pruebas.")
+        model, optimizer, start_epoch = load_last_checkpoint(model, optimizer, checkpoints_path)
+
+        if start_epoch < config["training"]["epochs"]:
+            loss_values = []
+            psnr_values = []
+
+            for epoch in range(start_epoch + 1, config["training"]["epochs"] + 1):
+                print(f"Epoch {epoch}/{config['training']['epochs']} para modelo {model_name}")
+                train_loss = train(train_loader, model, optimizer, criterion, device, model_name)
+                val_psnr = val(val_loader, model, device, model_name)
+
+                loss_values.append(train_loss)
+                psnr_values.append(val_psnr)
+
+                save_checkpoint(model, optimizer, checkpoints_path, epoch)
+
+                print(f"Epoch {epoch}, Loss: {train_loss:.4f}, PSNR: {val_psnr:.4f}")
+
+            save_metrics_to_csv(csv_path, loss_values, psnr_values)
+
+        print(f"Pruebas para modelo {model_name}")
         test_model(test_loader, model, model_name, device, test_path)
-        return
-
-    loss_values = []
-    psnr_values = []
-
-    for epoch in range(start_epoch + 1, config["training"]["epochs"] + 1):
-        print(f"Epoch {epoch}/{config['training']['epochs']}")
-        train_loss = train(train_loader, model, optimizer, criterion, device, model_name)
-        val_psnr = val(val_loader, model, device, model_name)
-
-        loss_values.append(train_loss)
-        psnr_values.append(val_psnr)
-
-        save_checkpoint(model, optimizer, checkpoints_path, epoch)
-        save_plots(loss_values, psnr_values, graphs_path, epoch)
-
-        print(f"Epoch {epoch}, Loss: {train_loss:.4f}, PSNR: {val_psnr:.4f}")
-
-    test_model(test_loader, model, model_name, device, test_path)
-
-
 
 if __name__ == "__main__":
     main()

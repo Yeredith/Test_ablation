@@ -1,10 +1,8 @@
+
 import torch
 import torch.nn as nn
 import math
-##Revisar modelos por que PSNR es muy bajo
-# ==========================
-# Componentes Compartidos
-# ==========================
+import torch.nn.functional as F
 
 class TwoCNN(nn.Module):
     def __init__(self, wn, n_feats=64): 
@@ -349,7 +347,6 @@ class MCNet(nn.Module):
 #################################
            #SFCCBAM
 #################################
-
 # Bloque de Atención de Canal con regularización L2
 class ChannelAttention(nn.Module):
     def __init__(self, n_feats, ratio=8):
@@ -378,6 +375,83 @@ class CBAM(nn.Module):
         x = self.channel_attention(x)
         return x
 
+# Clase TwoCNN con regularización y CBAM simplificado
+class SpatialCNN(nn.Module):
+    def __init__(self, wn, n_feats=64): 
+        super(SpatialCNN, self).__init__()
+        self.body = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(3,3), stride=1, padding=(1,1), bias=False))
+        
+        # Bloque CBAM simplificado
+        self.cbam = CBAM(n_feats)
+        
+        # Capa de ajuste de canales, se configura dinámicamente en forward
+        self.adjust_channels = None
+
+    def forward(self, x):
+        out = self.body(x)
+        
+        # Pasamos `out` a través del CBAM y ajustamos los canales si es necesario
+        out = self.cbam(out.unsqueeze(2)).squeeze(2)  # Adaptamos CBAM a 2D convolución
+
+        # Configuración dinámica de `adjust_channels` para igualar canales de `x`
+        if out.shape[1] != x.shape[1]:
+            self.adjust_channels = nn.Conv2d(out.shape[1], x.shape[1], kernel_size=1).to(out.device)
+            out = self.adjust_channels(out)
+        
+        # Realizamos la suma
+        out = torch.add(out, x)
+        return out             
+
+# Clase ThreeCNN con regularización y CBAM simplificado
+class SpectralCNN(nn.Module):
+    def __init__(self, wn, n_feats=64):
+        super(SpectralCNN, self).__init__()
+        self.act = nn.ReLU(inplace=True)
+
+        # Inicializamos las capas de convolución 3D con n_feats canales
+        body_spatial = []
+        for i in range(2):
+            body_spatial.append(wn(nn.Conv3d(n_feats, n_feats, kernel_size=(1,3,3), stride=1, padding=(0,1,1), bias=False)))
+        
+        body_spectral = []
+        for i in range(2):
+            body_spectral.append(wn(nn.Conv3d(n_feats, n_feats, kernel_size=(3,1,1), stride=1, padding=(1,0,0), bias=False)))
+        
+        self.body_spatial = nn.Sequential(*body_spatial)
+        self.body_spectral = nn.Sequential(*body_spectral)
+        
+        # Bloque CBAM simplificado
+        self.cbam = CBAM(n_feats)
+        
+        # Ajuste de canales: se configura dinámicamente en forward() según el tamaño de entrada
+        self.adjust_channels = None
+
+    def forward(self, x): 
+        out = x
+        for i in range(2):  
+            out_spatial = self.body_spatial[i](out)
+            out_spectral = self.body_spectral[i](out)
+            
+            # Sumamos out_spatial y out_spectral
+            out = torch.add(out_spatial, out_spectral)
+            if i == 0:
+                out = self.act(out)
+        
+        out = self.cbam(out)
+        
+        # Configuración dinámica de self.adjust_channels para igualar canales de `x`
+        if out.shape[1] != x.shape[1]:
+            self.adjust_channels = nn.Conv3d(out.shape[1], x.shape[1], kernel_size=1).to(out.device)
+            out = self.adjust_channels(out)
+        
+        # Verificamos la compatibilidad de las dimensiones antes de la suma final con x
+        if out.shape == x.shape:
+            out = torch.add(out, x)
+        else:
+            print(f"Dimension mismatch before final addition: out {out.shape}, x {x.shape}")
+            return None
+        
+        return out
 
 # Clase SFCCBAM
 class SFCCBAM(nn.Module):
@@ -416,11 +490,11 @@ class SFCCBAM(nn.Module):
         self.TwoTail = nn.Sequential(*TwoTail)
 
         # Convoluciones y atenciones
-        self.twoCNN = nn.Sequential(*[TwoCNN(wn, n_feats) for _ in range(self.n_module)])
+        self.twoCNN = nn.Sequential(*[SpatialCNN(wn, n_feats) for _ in range(self.n_module)])
         self.reduceD_Y = wn(nn.Conv2d(n_feats*self.n_module, n_feats, kernel_size=(1,1), stride=1, bias=False))                          
         self.twofusion = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(3,3),  stride=1, padding=(1,1), bias=False))
 
-        self.threeCNN = nn.Sequential(*[ThreeCNN(wn, n_feats) for _ in range(self.n_module)])
+        self.threeCNN = nn.Sequential(*[SpectralCNN(wn, n_feats) for _ in range(self.n_module)])
         self.reduceD = nn.Sequential(*[wn(nn.Conv2d(n_feats*4, n_feats, kernel_size=(1,1), stride=1, bias=False)) for _ in range(self.n_module)])                              
         self.reduceD_X = wn(nn.Conv3d(n_feats*self.n_module, n_feats, kernel_size=(1,1,1), stride=1, bias=False))
         
@@ -481,82 +555,155 @@ class SFCCBAM(nn.Module):
         y = y.squeeze(1)   
                 
         return y, localFeats  
-    
+
+
+
 #################################
 #######Hybrid-SFCSR##############
 #################################
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation (SE) Block"""
-    def __init__(self, channels, reduction=8):
-        super(SEBlock, self).__init__()
-        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Conv2d(channels // reduction, channels, kernel_size=1)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class SqueezeExcitation(nn.Module):
+    def __init__(self, n_feats, ratio=8):
+        super(SqueezeExcitation, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.fc1 = nn.Conv3d(n_feats, n_feats // ratio, kernel_size=1, bias=False)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Conv3d(n_feats // ratio, n_feats, kernel_size=1, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        se_weight = self.global_avg_pool(x)
-        se_weight = self.fc1(se_weight)
-        se_weight = self.relu(se_weight)
-        se_weight = self.fc2(se_weight)
-        se_weight = self.sigmoid(se_weight)
-        return x * se_weight
+        scale = self.avg_pool(x)
+        scale = self.fc2(self.relu(self.fc1(scale)))
+        return x * self.sigmoid(scale)
 
 
-class CBAMBlock(nn.Module):
-    """Convolutional Block Attention Module (CBAM)"""
-    def __init__(self, channels, reduction=8, kernel_size=7):
-        super(CBAMBlock, self).__init__()
-        # Channel Attention
-        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.global_max_pool = nn.AdaptiveMaxPool2d(1)
-        self.fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False)
-        self.sigmoid_channel = nn.Sigmoid()
+# Bloque de Atención de Canal con regularización L2
+class ChannelAttention_F(nn.Module):
+    def __init__(self, n_feats, ratio=8):
+        super(ChannelAttention_F, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.max_pool = nn.AdaptiveMaxPool3d(1)
 
-        # Spatial Attention
-        self.conv_spatial = nn.Conv2d(2, 1, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, bias=False)
-        self.sigmoid_spatial = nn.Sigmoid()
+        self.fc1 = nn.Conv3d(n_feats, n_feats // ratio, kernel_size=1, bias=False)
+        self.fc2 = nn.Conv3d(n_feats // ratio, n_feats, kernel_size=1, bias=False)
+        self.relu = nn.ReLU()
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Channel Attention
-        avg_pool = self.global_avg_pool(x)
-        max_pool = self.global_max_pool(x)
-        channel_attention = self.fc1(avg_pool) + self.fc1(max_pool)
-        channel_attention = self.relu(channel_attention)
-        channel_attention = self.fc2(channel_attention)
-        channel_attention = self.sigmoid_channel(channel_attention)
-        x = x * channel_attention
+        avg_out = self.fc2(self.relu(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu(self.fc1(self.max_pool(x))))
+        return self.sigmoid(avg_out + max_out) * x
 
-        # Spatial Attention
+class SpatialAttention_F(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention_F, self).__init__()
+        assert kernel_size in (3, 7), "kernel_size must be 3 or 7"
+        padding = (kernel_size - 1) // 2
+        self.conv = nn.Conv3d(2, 1, kernel_size=(1, kernel_size, kernel_size), stride=1, padding=(0, padding, padding), bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
-        spatial_attention = self.conv_spatial(torch.cat([avg_out, max_out], dim=1))
-        spatial_attention = self.sigmoid_spatial(spatial_attention)
-        x = x * spatial_attention
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv(x)
+        return self.sigmoid(x)
 
-        return x
-
-
-class CombinedAttention(nn.Module):
-    """Combining SE Block and CBAM Block"""
-    def __init__(self, channels, reduction=8, kernel_size=7):
-        super(CombinedAttention, self).__init__()
-        self.se_block = SEBlock(channels, reduction)
-        self.cbam_block = CBAMBlock(channels, reduction, kernel_size)
+class CBAM_F(nn.Module):
+    def __init__(self, n_feats, ratio=8, kernel_size=7):
+        super(CBAM_F, self).__init__()
+        self.channel_attention = ChannelAttention_F(n_feats, ratio)
+        self.spatial_attention = SpatialAttention_F(kernel_size)
 
     def forward(self, x):
-        x = self.se_block(x)
-        x = self.cbam_block(x)
+        x = self.channel_attention(x)
+        x = x * self.spatial_attention(x)
         return x
+    
+class HybridAttention(nn.Module):
+    """Combina CBAM y SE en un único bloque de atención híbrida."""
+    def __init__(self, n_feats, ratio=8, kernel_size=7):
+        super(HybridAttention, self).__init__()
+        self.cbam = CBAM_F(n_feats, ratio , kernel_size )
+        self.se = SqueezeExcitation(n_feats, ratio)
+
+    def forward(self, x):
+        x = self.cbam(x)  # Primero aplicar CBAM
+        x = self.se(x)    # Luego aplicar SE
+        return x
+
+class ResidualDenoisingBlock(nn.Module):
+    def __init__(self, n_feats, kernel_size=3):
+        super(ResidualDenoisingBlock, self).__init__()
+        self.conv1 = nn.Conv2d(n_feats, n_feats, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(n_feats, n_feats, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
+
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.conv2(out)
+        return out + residual
+
+class SpaCNN(nn.Module):
+    def __init__(self, wn, n_feats=64): 
+        super(SpaCNN, self).__init__()
+        self.body = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(3,3), stride=1, padding=(1,1)))
+        #self.cbam = CBAM(n_feats)
+        #self.se = SqueezeExcitation(n_feats)
+        self.hybrid_attention = HybridAttention(n_feats)
+        self.denoising_block = ResidualDenoisingBlock(n_feats)
+
+    def forward(self, x):
+        out = self.body(x)
+        #out = self.cbam(out.unsqueeze(2)).squeeze(2)  # CBAM adaptado para 2D
+        #out = self.se(out.unsqueeze(2)).squeeze(2)  # SE adaptado para 2D
+        out = self.hybrid_attention(out.unsqueeze(2)).squeeze(2)
+        out = self.denoising_block(out)
+        out = torch.add(out, x)
+        return out
+
+
+class SpeCNN(nn.Module):
+    def __init__(self, wn, n_feats=64):
+        super(SpeCNN, self).__init__()
+        self.act = nn.ReLU(inplace=True)
+
+        body_spatial = []
+        for i in range(2):
+            body_spatial.append(wn(nn.Conv3d(n_feats, n_feats, kernel_size=(1,3,3), stride=1, padding=(0,1,1))))
+
+        body_spectral = []
+        for i in range(2):
+            body_spectral.append(wn(nn.Conv3d(n_feats, n_feats, kernel_size=(3,1,1), stride=1, padding=(1,0,0))))            
+
+        self.body_spatial = nn.Sequential(*body_spatial)
+        self.body_spectral = nn.Sequential(*body_spectral)
+        #self.cbam = CBAM(n_feats)
+        #self.se = SqueezeExcitation(n_feats)
+        self.hybrid_attention = HybridAttention(n_feats)  # Bloque híbrido
+
+    def forward(self, x): 
+        out = x
+        for i in range(2):
+            out = torch.add(self.body_spatial[i](out), self.body_spectral[i](out))
+            if i == 0:
+                out = self.act(out)
+        #out = self.cbam(out)
+        #out = self.se(out)
+        out = self.hybrid_attention(out)
+        out = torch.add(out, x)        
+        return out
+
 
 class HYBRID_SE_CBAM(nn.Module):
     def __init__(self, args):
         super(HYBRID_SE_CBAM, self).__init__()
-        
         scale = args.upscale_factor
         n_feats = args.n_feats
         self.n_module = args.n_module        
@@ -589,11 +736,11 @@ class HYBRID_SE_CBAM(nn.Module):
         self.TwoTail = nn.Sequential(*TwoTail)
 
         # Convoluciones y atenciones
-        self.twoCNN = nn.Sequential(*[TwoCNN(wn, n_feats) for _ in range(self.n_module)])
+        self.twoCNN = nn.Sequential(*[SpaCNN(wn, n_feats) for _ in range(self.n_module)])
         self.reduceD_Y = wn(nn.Conv2d(n_feats*self.n_module, n_feats, kernel_size=(1,1), stride=1, bias=False))                          
         self.twofusion = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(3,3),  stride=1, padding=(1,1), bias=False))
 
-        self.threeCNN = nn.Sequential(*[ThreeCNN(wn, n_feats) for _ in range(self.n_module)])
+        self.threeCNN = nn.Sequential(*[SpeCNN(wn, n_feats) for _ in range(self.n_module)])
         self.reduceD = nn.Sequential(*[wn(nn.Conv2d(n_feats*4, n_feats, kernel_size=(1,1), stride=1, bias=False)) for _ in range(self.n_module)])                              
         self.reduceD_X = wn(nn.Conv3d(n_feats*self.n_module, n_feats, kernel_size=(1,1,1), stride=1, bias=False))
         
@@ -605,11 +752,7 @@ class HYBRID_SE_CBAM(nn.Module):
         self.conv_DFF = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(1,1), stride=1, bias=False)) 
         self.reduceD_FCF = wn(nn.Conv2d(n_feats*2, n_feats, kernel_size=(1,1), stride=1, bias=False))  
         self.conv_FCF = wn(nn.Conv2d(n_feats, n_feats, kernel_size=(1,1), stride=1, bias=False))    
-
-        # SE Block and CBAM Block Integration
-        self.se_block = SEBlock(n_feats)
-        self.cbam_block = CBAMBlock(n_feats)
-
+    
     def forward(self, x, y, localFeats, i):
         x = x.unsqueeze(1)     
         x = self.ThreeHead(x)    
@@ -640,11 +783,6 @@ class HYBRID_SE_CBAM(nn.Module):
         y = torch.cat(channelY, 1)        
         y = self.reduceD_Y(y) 
         y = self.twofusion(y)        
-
-        # Apply SE Block
-        y = self.se_block(y)
-        # Apply CBAM Block
-        y = self.cbam_block(y)
      
         y = torch.cat([self.gamma_DFF[0]*x[:,:,0,:,:], self.gamma_DFF[1]*x[:,:,1,:,:], self.gamma_DFF[2]*x[:,:,2,:,:], self.gamma_DFF[3]*y], 1)
        
@@ -662,4 +800,4 @@ class HYBRID_SE_CBAM(nn.Module):
         y = self.TwoTail(y) 
         y = y.squeeze(1)   
                 
-        return y, localFeats
+        return y, localFeats  
