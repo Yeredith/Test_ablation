@@ -10,3 +10,13 @@ Test_ablation/
 │   └── ...
 ├── output/
 │   └── resultados_x4/
+├── Data/
+│   ├── Test
+│   |   ├── CAVE
+│   |   |   ├── X4
+│   ├── Train
+│   |   ├── CAVE
+│   |   |   ├── X4
+│   ├── Validation
+│   |   ├── CAVE
+│   |   |   ├── X4
